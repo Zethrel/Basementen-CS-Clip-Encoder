@@ -1,0 +1,32 @@
+{
+  "csdm_path": "csdm",
+  "demo_folder": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\replays",
+  "output_folder": "D:\\Clips",
+  "work_folder": "",
+  "steam_id": "00000000000000000",
+  "player_labels": {
+    "00000000000000000": "YourName"
+  },
+  "map_prefixes": {
+    "de_anubis": "Anubis",
+    "de_dust2": "Dust2",
+    "de_overpass": "Overpass"
+  },
+  "map_subfolders": true,
+  "map_folders": {
+    "de_dust2": "de_dust_2"
+  },
+  "seconds_before": 4,
+  "seconds_after": 3,
+  "video": {
+    "width": 1920,
+    "height": 1080,
+    "framerate": 30,
+    "container": "mkv",
+    "video_codec": "libx265",
+    "audio_codec": "aac",
+    "audio_bitrate": 512,
+    "crf": 28,
+    "recording_system": "HLAE"
+  }
+}

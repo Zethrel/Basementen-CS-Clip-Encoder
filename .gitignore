@@ -1,0 +1,12 @@
+# Your own paths and Steam ID. config.example.json is the tracked template.
+config.json
+
+# The list of demos already clipped on this PC.
+state.json
+state.json.tmp
+
+__pycache__/
+*.pyc
+
+# Where files go when device tooling cannot delete them.
+_to_delete/

@@ -1,0 +1,4 @@
+# Every text file is stored and checked out with LF line endings, so the files
+# are identical on Windows and on Linux and never show up as changed over
+# line endings alone.
+* text=auto eol=lf
