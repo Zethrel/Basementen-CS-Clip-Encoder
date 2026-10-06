@@ -22,14 +22,30 @@ import re
 import shutil
 import string
 import subprocess
+import signal
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 TESTED_CSDM_VERSION = "3.20.1"
 
-APP_DIR = Path(__file__).resolve().parent
+
+
+def app_dir():
+    """The folder config.json and state.json live in.
+
+    Next to clipenc.py normally. In a built .exe the code is unpacked to a
+    temporary folder, so there it is the folder the .exe itself is in.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(os.path.abspath(sys.executable)).parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = app_dir()
 CONFIG_NAME = "config.json"
 STATE_NAME = "state.json"
 WORK_FOLDER_NAME = "_work"
@@ -78,6 +94,10 @@ SUFFIX_LENGTH = 8
 
 class ClipError(Exception):
     """A problem to show the user as one plain message, without a traceback."""
+
+
+class Stopped(ClipError):
+    """The run was stopped on purpose. Nothing is marked as done."""
 
 
 # --------------------------------------------------------------------------
@@ -366,16 +386,152 @@ def build_command(csdm, arguments, windows=None):
     return [str(csdm)] + arguments
 
 
-def run_csdm(csdm, arguments, dry_run=False):
-    """Run one csdm command with its output going straight to the console."""
-    print("> csdm " + " ".join(str(argument) for argument in arguments), flush=True)
+# What a recording leaves running. CSDM starts these, not this tool, so they
+# are not children of the csdm process and have to be closed by name.
+GAME_PROCESS_NAMES = ("cs2.exe", "HLAE.exe")
+
+
+def close_game_commands(windows=None):
+    """The commands that close CS2 and HLAE at once. Empty outside Windows."""
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return []
+    return [["taskkill", "/IM", name, "/F"] for name in GAME_PROCESS_NAMES]
+
+
+def hidden_process_options():
+    """Keep a started program from opening a console window of its own.
+
+    Outside Windows the program gets its own process group instead, so that
+    stopping it also stops whatever it started.
+    """
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {"start_new_session": True}
+
+
+def kill_process_tree(process):
+    """End a program and everything it started."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **hidden_process_options()
+            )
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
+class Runner:
+    """Where a run's messages go, and the csdm process it is running right now.
+
+    The command line uses a plain Runner: messages are printed and csdm writes
+    straight to the console. The window passes callbacks instead. csdm's
+    output is then read line by line and handed over, and no console is needed.
+
+    `on_line(text)` gets every message and every line csdm prints.
+    `on_stage(name, details)` is told when a demo moves to its next step.
+    Both are called from the thread that runs the work, not the window's.
+    """
+
+    def __init__(self, on_line=None, on_stage=None):
+        self.on_line = on_line
+        self.on_stage = on_stage
+        self.stop_requested = False
+        self.recording = False
+        self._process = None
+        self._lock = threading.Lock()
+
+    def say(self, text=""):
+        if self.on_line is None:
+            print(text, flush=True)
+            return
+        for line in str(text).splitlines() or [""]:
+            self.on_line(line)
+
+    def stage(self, name, **details):
+        if self.on_stage is not None:
+            self.on_stage(name, details)
+
+    def check_stopped(self):
+        if self.stop_requested:
+            raise Stopped("Stopped. The demo that was being recorded is not marked as done.")
+
+    def run(self, csdm, arguments):
+        """Run one csdm command to its end and return its exit code."""
+        self.check_stopped()
+        command = build_command(csdm, arguments)
+        try:
+            if self.on_line is None:
+                process = subprocess.Popen(command)
+            else:
+                process = subprocess.Popen(
+                    command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1, **hidden_process_options()
+                )
+        except OSError as error:
+            raise ClipError("Could not start csdm: %s" % error)
+        with self._lock:
+            self._process = process
+        if self.stop_requested:
+            # stop() came in while csdm was starting and found nothing to end.
+            # It set the flag first, so one of the two always sees the other.
+            kill_process_tree(process)
+        try:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    self.on_line(line.rstrip("\r\n"))
+            code = process.wait()
+        except KeyboardInterrupt:
+            kill_process_tree(process)
+            raise
+        finally:
+            with self._lock:
+                self._process = None
+            if process.stdout is not None:
+                process.stdout.close()
+        self.check_stopped()
+        return code
+
+    def stop(self):
+        """Stop the run now: end csdm, and close CS2 if a recording is under way.
+
+        CS2 is closed by name, so it is left alone unless this run started it:
+        a game the user has open while a demo is only being read stays open.
+        Safe to call from any thread.
+        """
+        self.stop_requested = True      # before the lock: see run()
+        with self._lock:
+            process = self._process
+            recording = self.recording
+        if process is not None and process.poll() is None:
+            kill_process_tree(process)
+        if not recording:
+            return
+        for command in close_game_commands():
+            try:
+                subprocess.run(
+                    command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **hidden_process_options()
+                )
+            except OSError:
+                pass
+
+
+def run_csdm(csdm, arguments, dry_run=False, runner=None):
+    """Run one csdm command. Its output goes wherever the runner sends it."""
+    runner = runner or Runner()
+    runner.say("> csdm " + " ".join(str(argument) for argument in arguments))
     if dry_run:
         return 0
-    try:
-        completed = subprocess.run(build_command(csdm, arguments))
-    except OSError as error:
-        raise ClipError("Could not start csdm: %s" % error)
-    return completed.returncode
+    return runner.run(csdm, arguments)
 
 
 def video_arguments(demo, steam_id, config, output_folder, before, after):
@@ -412,7 +568,7 @@ def video_arguments(demo, steam_id, config, output_folder, before, after):
     ]
 
 
-def export_match(csdm, demo, json_folder):
+def export_match(csdm, demo, json_folder, runner=None):
     """Analyze the demo in CSDM and return its exported match data.
 
     `csdm analyze` exits with 0 even when the analysis failed, so success is
@@ -421,13 +577,13 @@ def export_match(csdm, demo, json_folder):
     """
     json_folder = Path(json_folder)
     json_folder.mkdir(parents=True, exist_ok=True)
-    run_csdm(csdm, ["analyze", str(demo)])
-    run_csdm(csdm, ["json", str(demo), "--output-folder", str(json_folder)])
+    run_csdm(csdm, ["analyze", str(demo)], runner=runner)
+    run_csdm(csdm, ["json", str(demo), "--output-folder", str(json_folder)], runner=runner)
     exports = sorted(json_folder.glob("*.json"))
     if len(exports) != 1:
         raise ClipError(
             "CSDM did not export the match data for %s (found %d files).\n"
-            "Read its output above. The PostgreSQL service must be running."
+            "Read what CSDM printed. The PostgreSQL service must be running."
             % (demo, len(exports))
         )
     try:
@@ -453,6 +609,40 @@ def player_in_match(match, steam_id):
 
 def kill_count(match, steam_id):
     return sum(1 for kill in match.get("kills") or [] if kill.get("killerSteamId") == steam_id)
+
+
+def match_summary(match):
+    """The part of CSDM's export worth remembering: the map and who played."""
+    players = []
+    for player in match.get("players") or []:
+        steam_id = player.get("steamId")
+        if not steam_id:
+            continue
+        players.append({
+            "steam_id": str(steam_id),
+            "name": str(player.get("name") or ""),
+            "team": str(player.get("teamName") or ""),
+            "kills": kill_count(match, steam_id),
+        })
+    return {
+        "map": match.get("mapName") or "unknown",
+        "checksum": str(match.get("checksum") or ""),
+        "players": players,
+    }
+
+
+def remember_demo(state, demo, summary):
+    """Keep a demo's map and players in the state, whether or not it is clipped."""
+    entry = state["demos"].setdefault(demo_key(demo), {"file": Path(demo).name, "players": {}})
+    entry.setdefault("players", {})
+    entry["map"] = summary["map"]
+    entry["info"] = summary
+    return entry
+
+
+def demo_info(state, key):
+    """The remembered map and players of a demo, or None if CSDM has not read it yet."""
+    return state["demos"].get(key, {}).get("info")
 
 
 def clip_sort_key(path):
@@ -503,42 +693,86 @@ def new_work_folder(config, rng=random):
     return folder
 
 
-def remove_work_folder(folder):
-    shutil.rmtree(folder, ignore_errors=True)
+def remove_work_folder(folder, attempts=1):
+    """Delete a work folder, and the folder above it if that is then empty.
+
+    With `attempts` above 1 it tries again for a few seconds: files a program
+    was writing stay locked for a moment after that program is ended.
+    """
+    for attempt in range(attempts):
+        shutil.rmtree(folder, ignore_errors=True)
+        if not Path(folder).exists():
+            break
+        if attempt + 1 < attempts:
+            time.sleep(0.5)
     try:
         Path(folder).parent.rmdir()
     except OSError:
         pass
 
 
-def clip_demo(demo, steam_id, config, state, state_path, csdm, before, after, rng=random):
+def load_demo_info(demo, config, state, state_path, csdm, runner=None):
+    """Have CSDM read a demo, without recording, and remember its map and players.
+
+    This takes a few seconds and does not start CS2.
+    """
+    demo = Path(os.path.abspath(str(demo)))
+    work = new_work_folder(config)
+    try:
+        match = export_match(csdm, demo, work / "json", runner)
+    finally:
+        remove_work_folder(work)
+    summary = match_summary(match)
+    remember_demo(state, demo, summary)
+    save_state(state_path, state)
+    return summary
+
+
+def clip_demo(demo, steam_id, config, state, state_path, csdm, before, after, rng=random, runner=None):
     """Record, rename and move the clips for one player in one demo.
 
     Returns the list of finished clip paths. The demo is recorded as done when
-    this returns, including when the player has no kills in it.
+    this returns, including when the player has no kills in it. If the run is
+    stopped, nothing is marked as done and the work folder is removed.
     """
+    runner = runner or Runner()
+    work = new_work_folder(config, rng)
+    try:
+        return _clip_demo(demo, steam_id, config, state, state_path, csdm, before, after, rng, runner, work)
+    except Stopped:
+        remove_work_folder(work, attempts=10)
+        raise
+
+
+def _clip_demo(demo, steam_id, config, state, state_path, csdm, before, after, rng, runner, work):
     # Absolute paths, because CSDM is a separate program with its own idea of
     # the current folder.
     demo = Path(os.path.abspath(str(demo)))
     output_folder = Path(os.path.abspath(str(config["output_folder"])))
-    work = new_work_folder(config, rng)
     video_folder = work / "video"
     video_folder.mkdir()
 
-    print("\n== %s" % demo.name, flush=True)
+    runner.say("")
+    runner.say("== %s" % demo.name)
+    runner.stage("analyze", demo=demo.name, player=steam_id)
     try:
-        match = export_match(csdm, demo, work / "json")
+        match = export_match(csdm, demo, work / "json", runner)
+    except Stopped:
+        raise
     except ClipError:
         # Nothing was recorded yet, so there is nothing worth keeping.
         remove_work_folder(work)
         raise
     map_name = match.get("mapName") or "unknown"
+    remember_demo(state, demo, match_summary(match))
+    save_state(state_path, state)
 
     if not player_in_match(match, steam_id):
-        print("Player %s is not in this demo. Marked as done with no clips." % steam_id)
+        runner.say("Player %s is not in this demo. Marked as done with no clips." % steam_id)
         record_done(state, demo, steam_id, map_name, [], "player not in demo")
         save_state(state_path, state)
         remove_work_folder(work)
+        runner.stage("done", demo=demo.name, player=steam_id, clips=0)
         return []
 
     kills = kill_count(match, steam_id)
@@ -546,25 +780,34 @@ def clip_demo(demo, steam_id, config, state, state_path, csdm, before, after, rn
         config["player_labels"].get(steam_id) or player_name(match, steam_id), steam_id
     )
     if kills == 0:
-        print("%s has no kills in this demo. Marked as done with no clips." % label)
+        runner.say("%s has no kills in this demo. Marked as done with no clips." % label)
         record_done(state, demo, steam_id, map_name, [], "no kills")
         save_state(state_path, state)
         remove_work_folder(work)
+        runner.stage("done", demo=demo.name, player=steam_id, clips=0)
         return []
 
     prefix, from_table = map_prefix(map_name, config["map_prefixes"])
     if not from_table:
-        print(
+        runner.say(
             'Map %s is not in map_prefixes, so the clips are named "%s". '
             "Add it to config.json to choose the name." % (map_name, prefix)
         )
-    print(
+    runner.say(
         "%s on %s: %d kills. Recording now. CS2 will open and the PC is busy until it closes."
-        % (label, map_name, kills),
-        flush=True,
+        % (label, map_name, kills)
     )
 
-    code = run_csdm(csdm, video_arguments(demo, steam_id, config, video_folder, before, after))
+    runner.stage("record", demo=demo.name, player=steam_id, label=label, map=map_name, kills=kills)
+    runner.recording = True
+    try:
+        code = run_csdm(
+            csdm, video_arguments(demo, steam_id, config, video_folder, before, after), runner=runner
+        )
+    finally:
+        # Deliberately not under the lock: stop() reads it once, and a stop
+        # that lands exactly here finds no csdm process and nothing to close.
+        runner.recording = False
     if code != 0:
         raise ClipError(
             "CSDM stopped with exit code %d, so nothing was renamed.\n"
@@ -580,12 +823,13 @@ def clip_demo(demo, steam_id, config, state, state_path, csdm, before, after, rn
         )
 
     # Only now, with clips in hand, is the map folder created.
+    runner.stage("sort", demo=demo.name, player=steam_id, clips=len(clips))
     target_folder = output_folder
     if config["map_subfolders"]:
         target_folder = output_folder / map_folder_name(map_name, prefix, config["map_folders"])
         if not target_folder.is_dir():
             target_folder.mkdir(parents=True)
-            print("Created the map folder %s" % target_folder)
+            runner.say("Created the map folder %s" % target_folder)
 
     finished = []
     sources = []
@@ -594,15 +838,16 @@ def clip_demo(demo, steam_id, config, state, state_path, csdm, before, after, rn
         shutil.move(str(clip), str(target))
         finished.append(target)
         sources.append(clip.name)
-        print("  %s  <-  %s" % (target.name, clip.name))
+        runner.say("  %s  <-  %s" % (target.name, clip.name))
 
     folder = target_folder.name if config["map_subfolders"] else ""
     record_done(
         state, demo, steam_id, map_name, [path.name for path in finished], folder=folder, sources=sources
     )
-    print("%d clip(s) are in %s" % (len(finished), target_folder))
+    runner.say("%d clip(s) are in %s" % (len(finished), target_folder))
     save_state(state_path, state)
     remove_work_folder(work)
+    runner.stage("done", demo=demo.name, player=steam_id, clips=len(finished), folder=str(target_folder))
     return finished
 
 

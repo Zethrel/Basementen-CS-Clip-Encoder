@@ -2,3 +2,10 @@
 # are identical on Windows and on Linux and never show up as changed over
 # line endings alone.
 * text=auto eol=lf
+
+# Except batch files: cmd misreads labels in a file with LF endings.
+*.cmd text eol=crlf
+
+# Never touched.
+*.png binary
+*.ico binary

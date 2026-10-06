@@ -16,7 +16,10 @@ import os
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import clipenc
@@ -26,7 +29,7 @@ STEAM_ID = "76561190000000001"
 OTHER_ID = "76561190000000002"
 
 STUB_SOURCE = r'''
-import json, os, sys
+import json, os, sys, time
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, "control.json"), encoding="utf-8") as handle:
     control = json.load(handle)
@@ -34,7 +37,14 @@ arguments = sys.argv[1:]
 with open(os.path.join(here, "calls.jsonl"), "a", encoding="utf-8") as log:
     log.write(json.dumps(arguments) + "\n")
 command = arguments[0] if arguments else ""
+if os.environ.get("CLIPENC_TEST_QUIET"):
+    # Run from the command line path, where this output would land in the
+    # middle of the test report instead of being read by the tool.
+    sys.stdout = open(os.devnull, "w")
 if command == "analyze":
+    print("1 demos to process", flush=True)
+    if control.get("analyze_sleep"):
+        time.sleep(control["analyze_sleep"])
     sys.exit(0)
 if command == "json":
     folder = arguments[arguments.index("--output-folder") + 1]
@@ -43,7 +53,12 @@ if command == "json":
             json.dump(control["match"], handle)
     sys.exit(0)
 if command == "video":
+    print("Starting Counter-Strike...", flush=True)
+    print("Recording in progress...", flush=True)
+    if control.get("sleep"):
+        time.sleep(control["sleep"])
     if control.get("video_exit", 0) != 0:
+        print("Error while generating the video", flush=True)
         sys.exit(control["video_exit"])
     folder = arguments[arguments.index("--output") + 1]
     if control.get("layout") == "nested":
@@ -68,7 +83,11 @@ def make_match(map_name="de_overpass", names=None, killers=()):
     names = names or {STEAM_ID: "Zethrel", OTHER_ID: "Teammate"}
     return {
         "mapName": map_name,
-        "players": [{"steamId": steam_id, "name": name} for steam_id, name in names.items()],
+        "checksum": "0123456789abcdef",
+        "players": [
+            {"steamId": steam_id, "name": name, "teamName": "Team B" if steam_id == STEAM_ID else "Team A"}
+            for steam_id, name in names.items()
+        ],
         "kills": [
             {"killerSteamId": steam_id, "tick": 1000 + index * 700, "roundNumber": 1 + index}
             for index, steam_id in enumerate(killers)
@@ -236,6 +255,20 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(clipenc.build_command("/usr/bin/csdm", ["analyze", "x.dem"], windows=False), ["/usr/bin/csdm", "analyze", "x.dem"])
         self.assertEqual(clipenc.build_command("C:\\x\\csdm.exe", ["analyze"], windows=True), ["C:\\x\\csdm.exe", "analyze"])
 
+    def test_closing_the_game_is_windows_only(self):
+        self.assertEqual(clipenc.close_game_commands(windows=False), [])
+        self.assertEqual(
+            clipenc.close_game_commands(windows=True),
+            [["taskkill", "/IM", "cs2.exe", "/F"], ["taskkill", "/IM", "HLAE.exe", "/F"]],
+        )
+
+    def test_a_built_exe_keeps_its_files_next_to_itself(self):
+        with tempfile.TemporaryDirectory() as folder:
+            exe = os.path.join(folder, "CSClipEncoder.exe")
+            with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(sys, "executable", exe):
+                self.assertEqual(clipenc.app_dir(), Path(os.path.abspath(folder)))
+        self.assertEqual(clipenc.app_dir(), Path(clipenc.__file__).resolve().parent)
+
     def test_clip_order_follows_the_sequence_number(self):
         with tempfile.TemporaryDirectory() as folder:
             for name in ("sequence-10-tick-9-to-10.mkv", "sequence-2-tick-3-to-4.mkv", "sequence-1-tick-1-to-2.mkv", "notes.txt"):
@@ -247,8 +280,19 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(names, ["sequence-1-tick-1-to-2.mkv", "sequence-2-tick-3-to-4.mkv", "sequence-10-tick-9-to-10.mkv"])
 
 
-class EndToEndTests(unittest.TestCase):
+class StubCsdmCase(unittest.TestCase):
+    """A temporary demo folder, output folder, config and stand-in csdm.
+
+    It holds no tests of its own. test_clipgui.py builds on it as well.
+    """
+
     def setUp(self):
+        # Stopping a recording closes CS2 by name. No test may ever do that
+        # for real: these tests also run on a PC where the game can be open.
+        patcher = mock.patch.object(clipenc, "close_game_commands", return_value=[])
+        self.close_game = patcher.start()
+        self.addCleanup(patcher.stop)
+
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "clip enc & test"
         self.demos = self.root / "demos & replays"
@@ -305,7 +349,8 @@ class EndToEndTests(unittest.TestCase):
 
     def run_tool(self, *arguments):
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        quiet = mock.patch.dict(os.environ, {"CLIPENC_TEST_QUIET": "1"})
+        with quiet, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = clipenc.main(["--config", str(self.config_path), "--state", str(self.state_path)] + list(arguments))
         return code, out.getvalue(), err.getvalue()
 
@@ -326,6 +371,8 @@ class EndToEndTests(unittest.TestCase):
     def state(self):
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
+
+class EndToEndTests(StubCsdmCase):
     def test_clip_renames_moves_and_records(self):
         code, out, err = self.run_tool("clip")
         self.assertEqual((code, err), (0, ""))
@@ -469,7 +516,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("exit code 1", err)
         self.assertEqual(self.clips(), [])
-        self.assertFalse(self.state_path.exists())
+        self.assertIsNone(clipenc.done_entry(self.state(), clipenc.demo_key(self.demo), STEAM_ID))
         # And the demo is still offered on the next run.
         self.control(match=make_match(killers=[STEAM_ID]), clips=[[1, 10, 20]])
         self.assertEqual(self.run_tool("clip")[0], 0)
@@ -480,7 +527,7 @@ class EndToEndTests(unittest.TestCase):
         code, _, err = self.run_tool("clip")
         self.assertEqual(code, 1)
         self.assertIn("left no .mkv files", err)
-        self.assertFalse(self.state_path.exists())
+        self.assertIsNone(clipenc.done_entry(self.state(), clipenc.demo_key(self.demo), STEAM_ID))
 
     def test_missing_export_is_an_error(self):
         self.control(match=None)
@@ -616,6 +663,143 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("steam_id must be", out)
         self.assertIn("NOT FOUND", out)
+
+    # -- what the window relies on ----------------------------------------
+
+    def engine(self):
+        config = clipenc.load_config(self.config_path)
+        return config, clipenc.load_state(self.state_path), clipenc.resolve_csdm(config["csdm_path"])
+
+    def test_runner_gets_csdm_output_and_the_stages_in_order(self):
+        config, state, csdm = self.engine()
+        lines, stages = [], []
+        runner = clipenc.Runner(on_line=lines.append, on_stage=lambda name, details: stages.append((name, details)))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            clips = clipenc.clip_demo(self.demo, STEAM_ID, config, state, self.state_path, csdm, 4.0, 3.0, runner=runner)
+        self.assertEqual(len(clips), 3)
+        self.assertEqual(out.getvalue(), "", "with a runner, nothing is printed")
+        self.assertEqual([name for name, _ in stages], ["analyze", "record", "sort", "done"])
+        self.assertEqual(stages[1][1]["label"], "Zethrel")
+        self.assertEqual(stages[1][1]["kills"], 4)
+        self.assertEqual(stages[3][1]["clips"], 3)
+        text = "\n".join(lines)
+        for expected in ("> csdm analyze", "1 demos to process", "> csdm video", "Starting Counter-Strike...", "Recording in progress...", "3 clip(s) are in"):
+            self.assertIn(expected, text)
+
+    def test_players_are_remembered_after_a_clip(self):
+        self.run_tool("clip")
+        info = clipenc.demo_info(self.state(), clipenc.demo_key(self.demo))
+        self.assertEqual(info["map"], "de_overpass")
+        self.assertEqual(info["checksum"], "0123456789abcdef")
+        self.assertEqual(
+            info["players"],
+            [
+                {"steam_id": STEAM_ID, "name": "Zethrel", "team": "Team B", "kills": 4},
+                {"steam_id": OTHER_ID, "name": "Teammate", "team": "Team A", "kills": 0},
+            ],
+        )
+
+    def test_players_can_be_read_without_recording(self):
+        config, state, csdm = self.engine()
+        lines = []
+        summary = clipenc.load_demo_info(self.demo, config, state, self.state_path, csdm, clipenc.Runner(on_line=lines.append))
+        self.assertEqual([player["name"] for player in summary["players"]], ["Zethrel", "Teammate"])
+        self.assertEqual([call[0] for call in self.calls()], ["analyze", "json"])
+        saved = self.state()
+        self.assertEqual(clipenc.demo_info(saved, clipenc.demo_key(self.demo))["map"], "de_overpass")
+        self.assertIsNone(clipenc.done_entry(saved, clipenc.demo_key(self.demo), STEAM_ID), "reading players is not clipping")
+        self.assertFalse((self.output / clipenc.WORK_FOLDER_NAME).exists())
+        self.assertIn("1 demo(s), 1 not clipped yet", self.run_tool("list")[1])
+
+    def test_stop_ends_csdm_and_marks_nothing(self):
+        self.control(match=make_match(killers=[STEAM_ID]), clips=[[1, 10, 20]], sleep=60)
+        config, state, csdm = self.engine()
+        recording = threading.Event()
+        runner = clipenc.Runner(
+            on_line=lambda line: None,
+            on_stage=lambda name, details: recording.set() if name == "record" else None,
+        )
+        outcome = {}
+
+        def work():
+            try:
+                clipenc.clip_demo(self.demo, STEAM_ID, config, state, self.state_path, csdm, 4.0, 3.0, runner=runner)
+                outcome["result"] = "finished"
+            except clipenc.Stopped:
+                outcome["result"] = "stopped"
+            except Exception as error:  # pragma: no cover - shown by the assert below
+                outcome["result"] = repr(error)
+
+        thread = threading.Thread(target=work)
+        started = time.monotonic()
+        thread.start()
+        self.assertTrue(recording.wait(20), "the recording step never started")
+        time.sleep(0.5)
+        runner.stop()
+        thread.join(20)
+        self.assertFalse(thread.is_alive(), "the run did not end after stop")
+        self.assertLess(time.monotonic() - started, 40)
+        self.assertEqual(outcome["result"], "stopped")
+        self.assertEqual(self.clips(), [])
+        self.assertIsNone(clipenc.done_entry(self.state(), clipenc.demo_key(self.demo), STEAM_ID))
+        self.assertFalse((self.output / clipenc.WORK_FOLDER_NAME).exists(), "a stopped run leaves no work folder")
+        self.close_game.assert_called_once_with()
+        self.assertFalse(runner.recording)
+
+    def test_stop_while_only_reading_a_demo_leaves_the_game_alone(self):
+        self.control(match=make_match(killers=[STEAM_ID]), analyze_sleep=60)
+        config, state, csdm = self.engine()
+        reading = threading.Event()
+        runner = clipenc.Runner(on_line=lambda line: reading.set() if "demos to process" in line else None)
+        outcome = {}
+
+        def work():
+            try:
+                clipenc.load_demo_info(self.demo, config, state, self.state_path, csdm, runner)
+                outcome["result"] = "finished"
+            except clipenc.Stopped:
+                outcome["result"] = "stopped"
+            except Exception as error:  # pragma: no cover - shown by the assert below
+                outcome["result"] = repr(error)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        self.assertTrue(reading.wait(20), "csdm analyze never started")
+        runner.stop()
+        thread.join(20)
+        self.assertFalse(thread.is_alive(), "reading did not end after stop")
+        self.assertEqual(outcome["result"], "stopped")
+        self.close_game.assert_not_called()
+        self.assertFalse((self.output / clipenc.WORK_FOLDER_NAME).exists())
+
+    def test_a_stop_that_lands_while_csdm_is_starting_still_ends_it(self):
+        self.control(match=make_match(killers=[STEAM_ID]), clips=[[1, 10, 20]], analyze_sleep=60)
+        config, state, csdm = self.engine()
+        runner = clipenc.Runner(on_line=lambda line: None)
+        real_build = clipenc.build_command
+
+        def build_then_stop(*arguments, **options):
+            # The narrowest moment: after the "was it stopped?" check, before csdm exists.
+            command = real_build(*arguments, **options)
+            runner.stop()
+            return command
+
+        started = time.monotonic()
+        with mock.patch.object(clipenc, "build_command", side_effect=build_then_stop):
+            with self.assertRaises(clipenc.Stopped):
+                clipenc.load_demo_info(self.demo, config, state, self.state_path, csdm, runner)
+        self.assertLess(time.monotonic() - started, 30, "csdm was left running to its end")
+        self.assertFalse((self.output / clipenc.WORK_FOLDER_NAME).exists())
+
+    def test_a_stopped_runner_starts_nothing(self):
+        config, state, csdm = self.engine()
+        runner = clipenc.Runner(on_line=lambda line: None)
+        runner.stop()
+        with self.assertRaises(clipenc.Stopped):
+            clipenc.clip_demo(self.demo, STEAM_ID, config, state, self.state_path, csdm, 4.0, 3.0, runner=runner)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.output / clipenc.WORK_FOLDER_NAME).exists())
 
     def test_damaged_state_file_is_a_plain_error(self):
         self.state_path.write_text("{not json", encoding="utf-8")

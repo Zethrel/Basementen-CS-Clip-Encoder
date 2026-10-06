@@ -8,5 +8,11 @@ state.json.tmp
 __pycache__/
 *.pyc
 
+# The built window and what PyInstaller leaves behind. build-exe.cmd makes them.
+CSClipEncoder.exe
+build/
+dist/
+*.spec
+
 # Where files go when device tooling cannot delete them.
 _to_delete/

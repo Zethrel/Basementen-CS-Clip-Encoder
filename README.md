@@ -1,14 +1,15 @@
 # Basementen CS Clip Encoder
 
-One command from a CS2 demo to finished kill clips named `Map-Player-random.mkv`,
-for example `Overpass-Zethrel-hfowpifb.mkv`.
+One step from a CS2 demo to finished kill clips named `Map-Player-random.mkv`,
+for example `Overpass-Zethrel-hfowpifb.mkv`. It has a window and a command line.
 
 It drives the command line of [CS Demo Manager](https://cs-demo-manager.com) (CSDM),
 which launches CS2, records one player's kills and encodes them. This tool then
 renames the clips and sorts them into one folder per map. It records and
 encodes nothing itself, and no part of CSDM is included here.
 
-- One file, `clipenc.py`
+- `clipenc.py` does the work and is the command line
+- `clipgui.py` is the window on top of it
 - Python standard library only
 - Windows only, English only
 
@@ -30,7 +31,36 @@ encodes nothing itself, and no part of CSDM is included here.
 
    It prints the settings and lists anything that is wrong.
 
-## Use
+## The window
+
+Build it once, and again after every change to the code:
+
+```
+build-exe.cmd
+```
+
+That makes `CSClipEncoder.exe` next to `config.json`, which is where it reads
+its settings from. It needs PyInstaller, for building only:
+`python -m pip install pyinstaller`. Without building, `python clipgui.py`
+opens the same window.
+
+- **Clip my new demos** clips your own kills from the newest demo that is not
+  clipped yet, or from the newest three, or from all of them.
+- **Click a demo** to see who played in it. CSDM reads the demo for this,
+  which takes a few seconds the first time and does not start CS2. After that
+  the players are remembered.
+- **Tick players and press Clip.** Teammates and opponents can both be
+  chosen. CS2 opens once for each player. A player without a kill cannot be
+  ticked.
+- **Stop run** closes CS2 at once. The demo that was being recorded stays
+  unclipped, and its half-finished files are deleted. Demos that were already
+  finished in the same run keep their clips.
+- **Refresh** reads `config.json` and the demo folder again, for a demo that
+  arrived or a setting that changed while the window was open.
+- Settings are still edited in `config.json`. The window opens the file for
+  you and has no settings screen of its own.
+
+## The command line
 
 ```
 python clipenc.py list
@@ -117,8 +147,10 @@ To switch back, set them to `"libx265"` and `28`.
 
 ## Files it writes
 
-- `state.json`, next to `clipenc.py`: the demos already clipped, per player.
-  Delete it to make every demo count as new.
+- `state.json`, next to `clipenc.py` or the `.exe`: the demos already clipped,
+  per player, and the map and players of every demo CSDM has read for you. It
+  holds other players' names and Steam IDs, so it stays out of git. Delete it
+  to make every demo count as new.
 - The work folder (`work_folder`, or `_work` inside the output folder): where
   CSDM records before the clips are renamed. Each run gets its own subfolder.
   It is removed after a successful run and kept after a failed one, so you
@@ -132,12 +164,13 @@ To switch back, set them to `"libx265"` and `28`.
   not running.
 - **Steam is not running:** CSDM needs it to launch CS2.
 - A failed demo is not marked as done, so the next `clip` tries it again.
-- If you stop a run with Ctrl+C, CS2 may stay open. Close it yourself.
+- If you stop a command line run with Ctrl+C, CS2 may stay open. Close it
+  yourself. The window's Stop button closes it for you.
 
 ## Not included yet
 
 - X-ray on kills through smoke or a wall.
-- A window. This is command line only.
+- A settings screen. Settings are edited in `config.json`.
 
 ## Tests
 
@@ -145,9 +178,10 @@ To switch back, set them to `"libx265"` and `28`.
 python -m unittest -v
 ```
 
-The tests never start CSDM or CS2. They use a small stand-in `csdm` that
-writes the same kind of files. On Windows the stand-in is a `csdm.cmd` file,
-like the real launcher.
+The tests never start CSDM or CS2, and never close a running game. They use a
+small stand-in `csdm` that writes the same kind of files. On Windows the
+stand-in is a `csdm.cmd` file, like the real launcher. The window tests open
+the real window for a moment and drive it against the same stand-in.
 
 ## Licence
 
